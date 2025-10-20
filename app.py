@@ -28,6 +28,33 @@ if GEMINI_API_KEY:
 else:
 	st.warning("No Gemini API key found. Add it to Streamlit secrets or set environment variable 'GEMINI_API_KEY'. AI refactoring will be disabled.")
 
+# Utilities: sanitization and validation
+
+def sanitize_code(code: str) -> str:
+	"""Normalize newlines and strip zero-width/hidden characters that break parsers."""
+	if not code:
+		return ""
+	clean = code.replace("\r\n", "\n").replace("\r", "\n")
+	# Remove BOM and zero-width characters
+	clean = clean.replace("\ufeff", "").replace("\u200b", "").replace("\u200c", "").replace("\u200d", "")
+	# Ensure trailing newline to help some parsers
+	if not clean.endswith("\n"):
+		clean += "\n"
+	return clean
+
+def validate_python(code: str):
+	"""Return (ok, err) where err includes line/col and message for SyntaxError."""
+	try:
+		ast.parse(code)
+		return True, None
+	except SyntaxError as e:
+		line = e.lineno or 0
+		col = e.offset or 0
+		msg = f"SyntaxError at line {line}, column {col}: {e.msg}"
+		return False, msg
+	except Exception as e:
+		return False, f"Parse error: {e}"
+
 # 3) Core Analysis Function
 
 def analyze_code_complexity(code: str):
@@ -156,87 +183,92 @@ if analyze_clicked:
 	if not user_code or not user_code.strip():
 		st.error("Please paste some Python code before analyzing.")
 	else:
-		total_complexity, mi_score = analyze_code_complexity(user_code)
-		if total_complexity is None or mi_score is None:
-			st.error("Failed to analyze code. Ensure the code is valid Python.")
+		cleaned = sanitize_code(user_code)
+		ok, err = validate_python(cleaned)
+		if not ok:
+			st.error(f"Failed to analyze code: {err}")
 		else:
-			st.header("Analysis Results")
-			col1, col2 = st.columns(2)
+			total_complexity, mi_score = analyze_code_complexity(cleaned)
+			if total_complexity is None or mi_score is None:
+				st.error("Failed to analyze code. Ensure the code is valid Python.")
+			else:
+				st.header("Analysis Results")
+				col1, col2 = st.columns(2)
 
-			with col1:
-				st.metric(label="Cyclomatic Complexity (Σ of functions/methods)", value=int(total_complexity))
-				if total_complexity < 6:
-					st.success("Lower is better. 1-5 Good")
-				elif 6 <= total_complexity <= 10:
-					st.warning("Moderate complexity. 6-10 Moderate")
-				else:
-					st.error("High complexity. 11+ High")
+				with col1:
+					st.metric(label="Cyclomatic Complexity (Σ of functions/methods)", value=int(total_complexity))
+					if total_complexity < 6:
+						st.success("Lower is better. 1-5 Good")
+					elif 6 <= total_complexity <= 10:
+						st.warning("Moderate complexity. 6-10 Moderate")
+					else:
+						st.error("High complexity. 11+ High")
 
-			with col2:
-				st.metric(label="Maintainability Index (0-100)", value=round(float(mi_score), 2))
-				if mi_score > 19:
-					st.success("Higher is better. 20-100 High")
-				elif 10 <= mi_score <= 19:
-					st.warning("Medium maintainability. 10-19 Medium")
-				else:
-					st.error("Low maintainability. 0-9 Low")
+				with col2:
+					st.metric(label="Maintainability Index (0-100)", value=round(float(mi_score), 2))
+					if mi_score > 19:
+						st.success("Higher is better. 20-100 High")
+					elif 10 <= mi_score <= 19:
+						st.warning("Medium maintainability. 10-19 Medium")
+					else:
+						st.error("Low maintainability. 0-9 Low")
 
-			# Per-function refactor workflow
-			functions = extract_functions(user_code)
-			if functions:
-				st.subheader("Per-function Refactor")
-				# Compute per-function metrics
-				items = []
-				for fn in functions:
-					cc, mi = analyze_code_complexity(fn["code"])
-					if cc is not None and mi is not None:
-						items.append({"label": f"{fn['name']} (L{fn['start']}-{fn['end']}) – CC {int(cc)}, MI {round(float(mi),2)}", "fn": fn, "cc": cc, "mi": mi})
-				if items:
-					labels = [it["label"] for it in items]
-					choice = st.selectbox("Select a function to refactor", labels, index=0)
-					selected = next((it for it in items if it["label"] == choice), None)
-					can_refactor = _is_api_configured()
-					refactor_clicked = st.button("Refactor selected function", disabled=not can_refactor)
-					if not can_refactor:
-						st.info("Provide GEMINI_API_KEY to enable AI refactoring.")
-					if refactor_clicked and selected:
-						with st.spinner("Generating function refactor..."):
-							suggestion = get_llm_refactoring_suggestion(selected["fn"]["code"], selected["cc"])
-						# Compute before/after metrics
-						before_cc, before_mi = selected["cc"], selected["mi"]
-						after_cc, after_mi = analyze_code_complexity(suggestion)
-						col_a, col_b = st.columns(2)
-						with col_a:
-							st.subheader("Original Function")
-							st.code(selected["fn"]["code"], language="python")
-							st.metric("CC (before)", int(before_cc))
-							st.metric("MI (before)", round(float(before_mi), 2))
-						with col_b:
-							st.subheader("Suggested Refactoring")
-							st.code(suggestion, language="python")
-							if after_cc is not None and after_mi is not None:
-								st.metric("CC (after)", int(after_cc))
-								st.metric("MI (after)", round(float(after_mi), 2))
-								if int(after_cc) < int(before_cc) and float(after_mi) >= float(before_mi):
-									st.success("Improved complexity and maintainability.")
-								elif int(after_cc) < int(before_cc):
-									st.success("Improved complexity.")
-								elif float(after_mi) > float(before_mi):
-									st.success("Improved maintainability.")
-								else:
-									st.warning("No improvement detected.")
-				else:
-					st.warning("No functions detected or metrics unavailable for selection.")
+				# Per-function refactor workflow
+				functions = extract_functions(cleaned)
+				if functions:
+					st.subheader("Per-function Refactor")
+					# Compute per-function metrics
+					items = []
+					for fn in functions:
+						cc, mi = analyze_code_complexity(fn["code"])
+						if cc is not None and mi is not None:
+							items.append({"label": f"{fn['name']} (L{fn['start']}-{fn['end']}) – CC {int(cc)}, MI {round(float(mi),2)}", "fn": fn, "cc": cc, "mi": mi})
+					if items:
+						labels = [it["label"] for it in items]
+						choice = st.selectbox("Select a function to refactor", labels, index=0)
+						selected = next((it for it in items if it["label"] == choice), None)
+						can_refactor = _is_api_configured()
+						refactor_clicked = st.button("Refactor selected function", disabled=not can_refactor)
+						if not can_refactor:
+							st.info("Provide GEMINI_API_KEY to enable AI refactoring.")
+						if refactor_clicked and selected:
+							with st.spinner("Generating function refactor..."):
+								suggestion = get_llm_refactoring_suggestion(selected["fn"]["code"], selected["cc"])
+							# Compute before/after metrics
+							before_cc, before_mi = selected["cc"], selected["mi"]
+							after_cc, after_mi = analyze_code_complexity(suggestion)
+							col_a, col_b = st.columns(2)
+							with col_a:
+								st.subheader("Original Function")
+								st.code(selected["fn"]["code"], language="python")
+								st.metric("CC (before)", int(before_cc))
+								st.metric("MI (before)", round(float(before_mi), 2))
+							with col_b:
+								st.subheader("Suggested Refactoring")
+								st.code(suggestion, language="python")
+								if after_cc is not None and after_mi is not None:
+									st.metric("CC (after)", int(after_cc))
+									st.metric("MI (after)", round(float(after_mi), 2))
+									if int(after_cc) < int(before_cc) and float(after_mi) >= float(before_mi):
+										st.success("Improved complexity and maintainability.")
+									elif int(after_cc) < int(before_cc):
+										st.success("Improved complexity.")
+									elif float(after_mi) > float(before_mi):
+										st.success("Improved maintainability.")
+									else:
+										st.warning("No improvement detected.")
+					else:
+						st.warning("No functions detected or metrics unavailable for selection.")
 
-			# AI Refactoring for high complexity (whole snippet)
-			if total_complexity > 10:
-				st.header("🤖 AI Refactoring Suggestion")
-				with st.spinner("Generating suggestion..."):
-					suggestion = get_llm_refactoring_suggestion(user_code, total_complexity)
-				col_a, col_b = st.columns(2)
-				with col_a:
-					st.subheader("Original Code")
-					st.code(user_code, language="python")
-				with col_b:
-					st.subheader("Suggested Refactoring")
-					st.code(suggestion, language="python")
+				# AI Refactoring for high complexity (whole snippet)
+				if total_complexity > 10:
+					st.header("🤖 AI Refactoring Suggestion")
+					with st.spinner("Generating suggestion..."):
+						suggestion = get_llm_refactoring_suggestion(cleaned, total_complexity)
+					col_a, col_b = st.columns(2)
+					with col_a:
+						st.subheader("Original Code")
+						st.code(cleaned, language="python")
+					with col_b:
+						st.subheader("Suggested Refactoring")
+						st.code(suggestion, language="python")
