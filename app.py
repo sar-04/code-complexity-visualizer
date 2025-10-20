@@ -59,33 +59,69 @@ def validate_python(code: str):
 
 def analyze_code_complexity(code: str):
 	"""Return (total_cyclomatic_complexity, maintainability_index).
-	If radon fails to parse, return (None, None).
+	Robust to Radon failures: falls back to AST-based CC and MI=0.0.
 	"""
+	def _approximate_cc_with_ast(src: str) -> int:
+		try:
+			tree = ast.parse(src)
+		except Exception:
+			return 0
+		cc = 0
+		for node in ast.walk(tree):
+			if isinstance(node, (ast.If, ast.For, ast.AsyncFor, ast.While, ast.Try)):
+				cc += 1
+			elif isinstance(node, ast.BoolOp):
+				# Count boolean operators (and/or) as additional decision points
+				cc += max(0, len(getattr(node, 'values', [])) - 1)
+			elif isinstance(node, (ast.comprehension,)):
+				cc += 1
+			elif isinstance(node, ast.IfExp):
+				cc += 1
+		return max(cc, 0)
+
+	# Compute Cyclomatic Complexity (prefer Radon, fallback to AST)
 	try:
 		visitor = ComplexityVisitor.from_code(code)
-		total_complexity = sum(block.complexity for block in visitor.functions + visitor.methods)
-		# Maintainability Index (multi=True returns per block MI and aggregated values)
-		mi_scores = mi_visit(code, multi=True)
-		# mi_visit returns list of tuples when multi=True; we use global score if available
-		# Fallback: compute average of returned MI values if list of numbers
-		maintainability_index = None
-		if isinstance(mi_scores, (list, tuple)) and len(mi_scores) > 0:
-			# radon returns list of tuples (filename, mi) or list of MI values depending on version
-			# Normalize to a float MI: try to extract numeric values then average
+		total_complexity = sum(
+			block.complexity for block in (visitor.functions + visitor.methods)
+		)
+	except Exception:
+		total_complexity = _approximate_cc_with_ast(code)
+
+	# Compute Maintainability Index (best effort)
+	maintainability_index = None
+	try:
+		single_mi = mi_visit(code, multi=False)
+		maintainability_index = float(single_mi)
+	except Exception:
+		try:
+			mi_scores = mi_visit(code, multi=True)
 			values = []
-			for item in mi_scores:
-				if isinstance(item, (int, float)):
-					values.append(float(item))
-				elif isinstance(item, (list, tuple)) and len(item) >= 2 and isinstance(item[1], (int, float)):
-					values.append(float(item[1]))
+			if isinstance(mi_scores, dict):
+				for v in mi_scores.values():
+					try:
+						values.append(float(v))
+					except Exception:
+						pass
+			elif isinstance(mi_scores, (list, tuple)):
+				for item in mi_scores:
+					if isinstance(item, (int, float)):
+						values.append(float(item))
+					elif (
+						isinstance(item, (list, tuple))
+						and len(item) >= 2
+						and isinstance(item[1], (int, float))
+					):
+						values.append(float(item[1]))
 			if values:
 				maintainability_index = sum(values) / len(values)
-		if maintainability_index is None:
-			# As a last resort, compute single value with multi=False
-			maintainability_index = float(mi_visit(code, multi=False))
-		return total_complexity, maintainability_index
-	except Exception:
-		return None, None
+		except Exception:
+			maintainability_index = None
+
+	if maintainability_index is None:
+		maintainability_index = 0.0
+
+	return total_complexity, maintainability_index
 
 # Helper: extract per-function slices using AST
 
